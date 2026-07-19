@@ -194,6 +194,7 @@ pub fn ensure_bootstrap(store: &Store, session: &mut SessionFile) -> anyhow::Res
         if let Some(token) = session.auth.access_token.as_mut() {
             token.expires_at = 0;
         }
+        store.save(session)?;
         ensure_access(store, session, false)?;
         result = owa::get_bootstrap(&session.auth);
     }

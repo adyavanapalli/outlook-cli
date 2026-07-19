@@ -82,6 +82,14 @@ enum CalendarSubcommand {
         #[arg(long)]
         raw: bool,
     },
+    /// Retrieve one event, including its online meeting link and attendees
+    Get {
+        /// Immutable event ID returned by `calendar list`
+        id: String,
+        /// Emit the unmodified OWA response instead of normalized event JSON
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 fn main() {
@@ -109,6 +117,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Calendar(command) => match command {
             CalendarSubcommand::List { week, raw } => calendar::list(&store, week, raw),
+            CalendarSubcommand::Get { id, raw } => calendar::get(&store, &id, raw),
         },
         Command::Mail(command) => mail::run(&store, command),
         Command::Completions { shell } => {

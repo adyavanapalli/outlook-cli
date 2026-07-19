@@ -68,8 +68,18 @@ fn help_exposes_requested_command_tree() {
         assert!(!help.contains(absent));
     }
 
+    let help = success(home, &["calendar", "--help"]);
+    for expected in ["list", "get"] {
+        assert!(help.contains(expected));
+    }
+
     let help = success(home, &["calendar", "list", "--help"]);
     for expected in ["--week", "last", "current", "next"] {
+        assert!(help.contains(expected));
+    }
+
+    let help = success(home, &["calendar", "get", "--help"]);
+    for expected in ["<ID>", "--raw", "online meeting link"] {
         assert!(help.contains(expected));
     }
 
@@ -215,6 +225,15 @@ fn logout_preserves_configuration() {
 fn status_without_tokens_is_not_logged_in() {
     let temp = tempfile::tempdir().unwrap();
     assert!(success(temp.path(), &["auth", "status"]).contains("not logged in"));
+}
+
+#[test]
+fn calendar_get_validates_id_before_authentication() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(
+        failure(temp.path(), &["calendar", "get", ""])
+            .contains("calendar event ID cannot be empty")
+    );
 }
 
 #[test]

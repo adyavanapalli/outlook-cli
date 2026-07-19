@@ -552,6 +552,7 @@ where
         if let Some(token) = session.auth.access_token.as_mut() {
             token.expires_at = 0;
         }
+        store.save(session)?;
         auth::ensure_access(store, session, false)?;
         store.save(session)?;
         result = operation(&session.auth);

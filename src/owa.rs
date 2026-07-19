@@ -172,6 +172,35 @@ pub fn get_calendar_view(
     Ok(value)
 }
 
+pub fn get_calendar_event(
+    auth: &AuthState,
+    item_id: &str,
+    time_zone: &str,
+) -> Result<Value, OwaError> {
+    let (access_token, anchor_mailbox, client_version) = auth_context(auth)?;
+    let body = serde_json::to_vec(&calendar_event_request(item_id, time_zone))
+        .map_err(|error| OwaError::Failure(error.into()))?;
+    let response = http_client()
+        .map_err(OwaError::Failure)?
+        .post(format!(
+            "{SERVICE_ENDPOINT}?action=GetCalendarEvent&app=Calendar&n=0"
+        ))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("action", "GetCalendarEvent")
+        .header("content-type", "application/json; charset=utf-8")
+        .header("prefer", IMMUTABLE_ID_PREFERENCE)
+        .header("x-anchormailbox", anchor_mailbox)
+        .header("x-client-version", client_version)
+        .header("x-owa-actionsource", "GetCalendarEvent")
+        .header("x-owa-hosted-ux", "false")
+        .header("x-req-source", "Calendar")
+        .body(body)
+        .send()?;
+    let value = response_json(response, "OWA GetCalendarEvent")?;
+    validate_calendar_event_response(&value)?;
+    Ok(value)
+}
+
 pub fn get_mail_startup(auth: &AuthState) -> Result<Value, OwaError> {
     let (access_token, anchor_mailbox, client_version) = auth_context(auth)?;
     let response = http_client()
@@ -355,6 +384,26 @@ fn search_retry_delay(attempt: usize) {
     std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
 }
 
+fn validate_calendar_event_response(value: &Value) -> Result<(), OwaError> {
+    let message = value
+        .pointer("/Body/ResponseMessages/Items/0")
+        .unwrap_or(&Value::Null);
+    let field = |key| {
+        message
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    };
+    let response_class = field("ResponseClass");
+    let response_code = field("ResponseCode");
+    if response_class != "Success" || response_code != "NoError" {
+        return Err(OwaError::Failure(anyhow::anyhow!(
+            "OWA GetCalendarEvent failed: class={response_class}, code={response_code}"
+        )));
+    }
+    Ok(())
+}
+
 fn http_client() -> anyhow::Result<Client> {
     ClientBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -425,6 +474,34 @@ fn calendar_view_request(range: &WeekRange, time_zone: &str, calendar_id: &str) 
             "RangeEnd": wire_date(range.end_exclusive),
             "ClientSupportsIrm": true,
             "OptimizeExtendedPropertyLoading": true
+        }
+    })
+}
+
+fn calendar_event_request(item_id: &str, time_zone: &str) -> Value {
+    // This endpoint returns the standard event fields with IdOnly; Outlook Web
+    // uses the same shape and treats MaximumBodySize=0 as an unbounded body.
+    json!({
+        "__type": "GetCalendarEventJsonRequest:#Exchange",
+        "Header": exchange_header("V2018_01_08", time_zone),
+        "Body": {
+            "__type": "GetCalendarEventRequest:#Exchange",
+            "EventIds": [{
+                "__type": "ItemId:#Exchange",
+                "Id": item_id
+            }],
+            "ItemShape": {
+                "BaseShape": "IdOnly",
+                "BodyType": "HTML",
+                "FilterHtmlContent": true,
+                "AddBlankTargetToLinks": true,
+                "ImageProxyCapability": "OwaAndConnectorsProxy",
+                "ClientSupportsIrm": true,
+                "MaximumBodySize": 0,
+                "BlockExternalImages": true,
+                "BlockContentFromUnknownSenders": true
+            },
+            "DraftOnlineMeetingSupport": true
         }
     })
 }
@@ -702,9 +779,9 @@ fn safe_error_metadata_value(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MailFolder, MailSearchFolder, MailSearchQuery, Week, WeekRange, calendar_view_request,
-        compact_error, encode_owa_header, find_mail_items_request, get_mail_item_request,
-        mail_search_request, parse_bootstrap, transient_search_failure,
+        MailFolder, MailSearchFolder, MailSearchQuery, Week, WeekRange, calendar_event_request,
+        calendar_view_request, compact_error, encode_owa_header, find_mail_items_request,
+        get_mail_item_request, mail_search_request, parse_bootstrap, transient_search_failure,
     };
     use chrono::NaiveDate;
     use reqwest::StatusCode;
@@ -788,6 +865,16 @@ mod tests {
         let encoded = encode_owa_header(&request).unwrap();
         assert!(encoded.contains("Eastern%20Standard%20Time"));
         assert!(!encoded.contains("Eastern+Standard+Time"));
+    }
+
+    #[test]
+    fn calendar_get_request_asks_for_online_meeting_details() {
+        let request = calendar_event_request("item-id", "Eastern Standard Time");
+        assert_eq!(request["Body"]["EventIds"][0]["Id"], "item-id");
+        assert_eq!(request["Body"]["ItemShape"]["BaseShape"], "IdOnly");
+        assert_eq!(request["Body"]["ItemShape"]["BodyType"], "HTML");
+        assert_eq!(request["Body"]["ItemShape"]["BlockExternalImages"], true);
+        assert_eq!(request["Body"]["DraftOnlineMeetingSupport"], true);
     }
 
     #[test]

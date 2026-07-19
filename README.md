@@ -102,8 +102,14 @@ private API response data.
 ```bash
 outlook calendar list --week current
 outlook calendar list --week next | jq '.events[] | {start, subject, organizer}'
+outlook calendar get '<immutable-event-id>'
+outlook calendar get '<immutable-event-id>' | jq -r '.online_meeting_join_url'
 outlook calendar list --week last --raw
 ```
+
+`calendar get` returns the event body, attendees, reminder state, and online
+meeting details. Event IDs come from `calendar list`; add `--raw` to inspect the
+underlying private API response.
 
 Weeks run Sunday through Saturday. The timezone defaults from the operating
 system and can be overridden with:
