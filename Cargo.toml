@@ -3,10 +3,10 @@ name = "outlook-cli"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Unofficial CLI for Outlook Web calendar via private OWA APIs"
+description = "Unofficial CLI for Outlook Web calendar and mail via private OWA APIs"
 repository = "https://github.com/adyavanapalli/outlook-cli"
 license = "MIT"
-keywords = ["outlook", "calendar", "cli", "microsoft-365"]
+keywords = ["outlook", "calendar", "email", "cli", "microsoft-365"]
 categories = ["command-line-utilities"]
 publish = false
 

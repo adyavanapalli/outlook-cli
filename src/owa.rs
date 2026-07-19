@@ -6,13 +6,18 @@ use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, ClientBuilder, Response};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::fmt;
 use std::time::Duration;
+use uuid::Uuid;
 
 pub const DEFAULT_CLIENT_VERSION: &str = "20260710013.09";
 pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 const SERVICE_ENDPOINT: &str = "https://outlook.cloud.microsoft/owa/service.svc";
+const SEARCH_ENDPOINT: &str = "https://outlook.cloud.microsoft/searchservice/api/v2/query";
+const IMMUTABLE_ID_PREFERENCE: &str =
+    "IdType=\"ImmutableId\", exchange.behavior=\"IncludeThirdPartyOnlineMeetingProviders\"";
+const SEARCH_ATTEMPTS: usize = 3;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +66,30 @@ impl WeekRange {
 
 fn wire_date(date: NaiveDate) -> String {
     format!("{}T00:00:00.000", date.format("%Y-%m-%d"))
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MailFolder<'a> {
+    Distinguished(&'a str),
+    Id(&'a str),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MailSearchFolder<'a> {
+    All,
+    Current(&'a str),
+    Subfolders(&'a [String]),
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct MailSearchQuery<'a> {
+    pub query: &'a str,
+    pub folder: MailSearchFolder<'a>,
+    pub offset: usize,
+    pub limit: usize,
+    pub start: Option<NaiveDate>,
+    pub end: Option<NaiveDate>,
+    pub has_attachments: bool,
 }
 
 #[derive(Debug)]
@@ -121,10 +150,7 @@ pub fn get_calendar_view(
         .header("authorization", format!("Bearer {access_token}"))
         .header("action", "GetCalendarView")
         .header("content-type", "application/json; charset=utf-8")
-        .header(
-            "prefer",
-            "IdType=\"ImmutableId\", exchange.behavior=\"IncludeThirdPartyOnlineMeetingProviders\"",
-        )
+        .header("prefer", IMMUTABLE_ID_PREFERENCE)
         .header("x-anchormailbox", anchor_mailbox)
         .header("x-client-version", client_version)
         .header("x-owa-actionsource", "GetCalendarView")
@@ -144,6 +170,124 @@ pub fn get_calendar_view(
         )));
     }
     Ok(value)
+}
+
+pub fn get_mail_startup(auth: &AuthState) -> Result<Value, OwaError> {
+    let (access_token, anchor_mailbox, client_version) = auth_context(auth)?;
+    let response = http_client()
+        .map_err(OwaError::Failure)?
+        .post("https://outlook.cloud.microsoft/owa/startupdata.ashx?app=Mail&n=0")
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("action", "StartupData")
+        .header("prefer", IMMUTABLE_ID_PREFERENCE)
+        .header("x-anchormailbox", anchor_mailbox)
+        .header("x-client-version", client_version)
+        .header("x-message-count", "25")
+        .header("x-owa-actionsource", "StartupData")
+        .header("x-owa-hosted-ux", "false")
+        .header("x-req-source", "Mail")
+        .body(Vec::new())
+        .send()?;
+    response_json(response, "OWA mail startup data")
+}
+
+pub fn find_mail_items(
+    auth: &AuthState,
+    folder: MailFolder<'_>,
+    view_filter: &str,
+    offset: usize,
+    limit: usize,
+    time_zone: &str,
+) -> Result<Value, OwaError> {
+    let request = find_mail_items_request(folder, view_filter, offset, limit, time_zone);
+    post_mail_service(auth, "FindItem", "FindItem", None, &request)
+}
+
+pub fn get_mail_item(auth: &AuthState, item_id: &str, time_zone: &str) -> Result<Value, OwaError> {
+    let request = get_mail_item_request(item_id, time_zone);
+    post_mail_service(
+        auth,
+        "GetItem",
+        "LoadItem_ListViewSelectionChange",
+        Some("0"),
+        &request,
+    )
+}
+
+pub fn search_mail(
+    auth: &AuthState,
+    query: &MailSearchQuery<'_>,
+    time_zone: &str,
+) -> Result<Value, OwaError> {
+    let (access_token, anchor_mailbox, client_version) = auth_context(auth)?;
+    let body = serde_json::to_vec(&mail_search_request(query, time_zone))
+        .map_err(|error| OwaError::Failure(error.into()))?;
+    let client = http_client().map_err(OwaError::Failure)?;
+    for attempt in 0..SEARCH_ATTEMPTS {
+        let response = match client
+            .post(SEARCH_ENDPOINT)
+            .query(&[("n", "0"), ("cv", client_version)])
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("content-type", "application/json")
+            .header("prefer", IMMUTABLE_ID_PREFERENCE)
+            .header("x-anchormailbox", anchor_mailbox)
+            .header("x-client-version", client_version)
+            .header("x-owa-hosted-ux", "false")
+            .header("x-req-source", "Mail")
+            .body(body.clone())
+            .send()
+        {
+            Ok(response) => response,
+            Err(error)
+                if attempt + 1 < SEARCH_ATTEMPTS && (error.is_connect() || error.is_timeout()) =>
+            {
+                search_retry_delay(attempt);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (status, value) = response_parts(response, "Outlook mail search")?;
+        if status.is_success() {
+            return Ok(value);
+        }
+        if attempt + 1 < SEARCH_ATTEMPTS && transient_search_failure(status, &value) {
+            search_retry_delay(attempt);
+            continue;
+        }
+        return Err(http_failure("Outlook mail search", status, &value));
+    }
+    Err(OwaError::Failure(anyhow::anyhow!(
+        "Outlook mail search exhausted its retry attempts"
+    )))
+}
+
+fn post_mail_service(
+    auth: &AuthState,
+    action: &str,
+    action_source: &str,
+    priority: Option<&str>,
+    request: &Value,
+) -> Result<Value, OwaError> {
+    let (access_token, anchor_mailbox, client_version) = auth_context(auth)?;
+    let body = serde_json::to_vec(request).map_err(|error| OwaError::Failure(error.into()))?;
+    let mut builder = http_client()
+        .map_err(OwaError::Failure)?
+        .post(SERVICE_ENDPOINT)
+        .query(&[("action", action), ("app", "Mail"), ("n", "0")])
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("action", action)
+        .header("content-type", "application/json; charset=utf-8")
+        .header("prefer", IMMUTABLE_ID_PREFERENCE)
+        .header("x-anchormailbox", anchor_mailbox)
+        .header("x-client-version", client_version)
+        .header("x-owa-actionsource", action_source)
+        .header("x-owa-hosted-ux", "false")
+        .header("x-req-source", "Mail");
+    if let Some(priority) = priority {
+        builder = builder.header("x-owa-priority", priority);
+    }
+    let response = builder.body(body).send()?;
+    response_json(response, &format!("OWA {action}"))
 }
 
 fn auth_context(auth: &AuthState) -> Result<(&str, &str, &str), OwaError> {
@@ -166,25 +310,49 @@ fn auth_context(auth: &AuthState) -> Result<(&str, &str, &str), OwaError> {
 }
 
 fn response_json(response: Response, label: &str) -> Result<Value, OwaError> {
+    let (status, value) = response_parts(response, label)?;
+    if status.is_success() {
+        Ok(value)
+    } else {
+        Err(http_failure(label, status, &value))
+    }
+}
+
+fn response_parts(response: Response, label: &str) -> Result<(StatusCode, Value), OwaError> {
     if response.status() == StatusCode::UNAUTHORIZED {
         return Err(OwaError::Unauthorized);
     }
     let status = response.status();
     let bytes = response.bytes()?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        let snippet: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
-        OwaError::Failure(anyhow::anyhow!(
-            "{label} returned {status} with a non-JSON response: {snippet}"
-        ))
-    })?;
-    if status.is_success() {
-        Ok(value)
-    } else {
-        Err(OwaError::Failure(anyhow::anyhow!(
-            "{label} returned {status}: {}",
-            compact_error(&value)
-        )))
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok((status, value)),
+        Err(_) if !status.is_success() => Ok((status, Value::Null)),
+        Err(_) => Err(OwaError::Failure(anyhow::anyhow!(
+            "{label} returned {status} with a non-JSON response (body omitted)"
+        ))),
     }
+}
+
+fn http_failure(label: &str, status: StatusCode, value: &Value) -> OwaError {
+    OwaError::Failure(anyhow::anyhow!(
+        "{label} returned {status}: {}",
+        compact_error(value)
+    ))
+}
+
+fn transient_search_failure(status: StatusCode, value: &Value) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return true;
+    }
+    status == StatusCode::BAD_REQUEST
+        && serde_json::to_string(value).is_ok_and(|body| {
+            body.contains("FanoutExternalBadRequest")
+                || body.contains("TwoStepFanout_FirstStepFailed")
+        })
+}
+
+fn search_retry_delay(attempt: usize) {
+    std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
 }
 
 fn http_client() -> anyhow::Result<Client> {
@@ -261,18 +429,316 @@ fn calendar_view_request(range: &WeekRange, time_zone: &str, calendar_id: &str) 
     })
 }
 
+fn find_mail_items_request(
+    folder: MailFolder<'_>,
+    view_filter: &str,
+    offset: usize,
+    limit: usize,
+    time_zone: &str,
+) -> Value {
+    json!({
+        "__type": "FindItemJsonRequest:#Exchange",
+        "Header": exchange_header("V2018_01_08", time_zone),
+        "Body": {
+            "__type": "FindItemRequest:#Exchange",
+            "ParentFolderIds": [mail_folder_json(folder)],
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+                "AdditionalProperties": [
+                    {
+                        "__type": "PropertyUri:#Exchange",
+                        "FieldURI": "CopilotInboxHeadline"
+                    },
+                    {
+                        "__type": "PropertyUri:#Exchange",
+                        "FieldURI": "DeferredSendTime"
+                    }
+                ]
+            },
+            "ShapeName": "MailListItem",
+            "Paging": {
+                "__type": "IndexedPageView:#Exchange",
+                "BasePoint": "Beginning",
+                "Offset": offset,
+                "MaxEntriesReturned": limit
+            },
+            "ViewFilter": view_filter,
+            "SortOrder": [
+                {
+                    "__type": "SortResults:#Exchange",
+                    "Order": "Descending",
+                    "Path": {
+                        "__type": "PropertyUri:#Exchange",
+                        "FieldURI": "ReceivedOrRenewTime"
+                    }
+                },
+                {
+                    "__type": "SortResults:#Exchange",
+                    "Order": "Descending",
+                    "Path": {
+                        "__type": "PropertyUri:#Exchange",
+                        "FieldURI": "DateTimeReceived"
+                    }
+                }
+            ],
+            "FocusedViewFilter": -1,
+            "Traversal": "Shallow"
+        }
+    })
+}
+
+fn get_mail_item_request(item_id: &str, time_zone: &str) -> Value {
+    json!({
+        "__type": "GetItemJsonRequest:#Exchange",
+        "Header": exchange_header("V2017_08_18", time_zone),
+        "Body": {
+            "__type": "GetItemRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "IdOnly",
+                "AddBlankTargetToLinks": true,
+                "BlockContentFromUnknownSenders": false,
+                "BlockExternalImagesIfSenderUntrusted": true,
+                "ClientSupportsIrm": true,
+                "FilterHtmlContent": true,
+                "FilterInlineSafetyTips": true,
+                "MaximumBodySize": 2_097_152,
+                "MaximumRecipientsToReturn": 20,
+                "ImageProxyCapability": "OwaAndConnectorsProxy"
+            },
+            "ItemIds": [{
+                "__type": "ItemId:#Exchange",
+                "Id": item_id
+            }],
+            "ShapeName": "ItemNormalizedBody"
+        }
+    })
+}
+
+fn mail_search_request(query: &MailSearchQuery<'_>, time_zone: &str) -> Value {
+    // SearchService v2 interprets Size as an end position rather than a page
+    // length: Outlook sends From=25, Size=50 for the second 25-item window.
+    let end_position = query.offset.saturating_add(query.limit);
+    let refining_queries = if query.has_attachments {
+        json!([{
+            "RefinerString": "ShallowRefiner::SearchScope:hasattachment:true"
+        }])
+    } else {
+        Value::Null
+    };
+    json!({
+        "Cvid": Uuid::new_v4().to_string(),
+        "Scenario": {"Name": "owa.react"},
+        "TimeZone": time_zone,
+        "TextDecorations": "Off",
+        "EntityRequests": [{
+            "EntityType": "Message",
+            "ContentSources": ["Exchange", "ExchangeArchive"],
+            "Filter": mail_search_filter(query),
+            "From": query.offset,
+            "Query": {"QueryString": query.query},
+            "RefiningQueries": refining_queries,
+            "Size": end_position,
+            "Sort": [
+                {"Field": "Score", "SortDirection": "Desc", "Count": 7},
+                {"Field": "Time", "SortDirection": "Desc"}
+            ],
+            "EnableTopResults": true,
+            "TopResultsCount": 7
+        }],
+        "QueryAlterationOptions": {
+            "EnableSuggestion": true,
+            "EnableAlteration": true,
+            "SupportedRecourseDisplayTypes": [
+                "Suggestion",
+                "NoResultModification",
+                "NoResultFolderRefinerModification",
+                "NoRequeryModification",
+                "Modification"
+            ]
+        },
+        "LogicalId": Uuid::new_v4().to_string()
+    })
+}
+
+fn mail_search_filter(query: &MailSearchQuery<'_>) -> Value {
+    // Outlook Web includes Deleted Items alongside every selected UI scope.
+    let folder = match query.folder {
+        MailSearchFolder::All => json!({
+            "Or": [
+                {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
+                {"Term": {"DistinguishedFolderName": "DeletedItems"}}
+            ]
+        }),
+        MailSearchFolder::Current(id) => json!({
+            "Or": [
+                {"Term": {"FolderId": id}},
+                {"Term": {"DistinguishedFolderName": "DeletedItems"}}
+            ]
+        }),
+        MailSearchFolder::Subfolders(ids) => {
+            let mut folders = ids
+                .iter()
+                .map(|id| json!({"Term": {"FolderId": id}}))
+                .collect::<Vec<_>>();
+            folders.push(json!({
+                "Term": {"DistinguishedFolderName": "DeletedItems"}
+            }));
+            json!({"Or": folders})
+        }
+    };
+    if query.start.is_none() && query.end.is_none() {
+        return folder;
+    }
+    let mut received = Map::new();
+    if let Some(start) = query.start {
+        received.insert("gte".to_string(), json!(search_date(start)));
+    }
+    if let Some(end) = query.end {
+        received.insert("lte".to_string(), json!(search_date(end)));
+    }
+    json!({
+        "And": [
+            {"Range": {"received": received}},
+            folder
+        ]
+    })
+}
+
+fn mail_folder_json(folder: MailFolder<'_>) -> Value {
+    match folder {
+        MailFolder::Distinguished(id) => json!({
+            "__type": "DistinguishedFolderId:#Exchange",
+            "Id": id
+        }),
+        MailFolder::Id(id) => json!({
+            "__type": "FolderId:#Exchange",
+            "Id": id
+        }),
+    }
+}
+
+fn exchange_header(version: &str, time_zone: &str) -> Value {
+    json!({
+        "__type": "JsonRequestHeaders:#Exchange",
+        "RequestServerVersion": version,
+        "TimeZoneContext": {
+            "__type": "TimeZoneContext:#Exchange",
+            "TimeZoneDefinition": {
+                "__type": "TimeZoneDefinitionType:#Exchange",
+                "Id": time_zone
+            }
+        }
+    })
+}
+
+fn search_date(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
 fn compact_error(value: &Value) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "unknown OWA error".to_string())
-        .chars()
-        .take(500)
-        .collect()
+    let mut metadata = Vec::new();
+    collect_error_metadata(value, &mut metadata);
+    if metadata.is_empty() {
+        "details omitted".to_string()
+    } else {
+        metadata.join(", ")
+    }
+}
+
+fn collect_error_metadata(value: &Value, metadata: &mut Vec<String>) {
+    if metadata.len() >= 8 {
+        return;
+    }
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                let normalized = key.to_ascii_lowercase();
+                if matches!(
+                    normalized.as_str(),
+                    "code"
+                        | "errorcode"
+                        | "responsecode"
+                        | "responseclass"
+                        | "traceid"
+                        | "requestid"
+                        | "correlationid"
+                        | "httpcode"
+                ) && let Some(value) = safe_error_metadata_value(value)
+                {
+                    metadata.push(format!("{key}={value}"));
+                }
+                collect_error_metadata(value, metadata);
+                if metadata.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_error_metadata(value, metadata);
+                if metadata.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn safe_error_metadata_value(value: &Value) -> Option<String> {
+    if let Some(value) = value.as_u64() {
+        return Some(value.to_string());
+    }
+    let value = value.as_str()?;
+    (value.len() <= 100
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.:#".contains(character)))
+    .then(|| value.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Week, WeekRange, calendar_view_request, encode_owa_header, parse_bootstrap};
+    use super::{
+        MailFolder, MailSearchFolder, MailSearchQuery, Week, WeekRange, calendar_view_request,
+        compact_error, encode_owa_header, find_mail_items_request, get_mail_item_request,
+        mail_search_request, parse_bootstrap, transient_search_failure,
+    };
     use chrono::NaiveDate;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn error_summaries_include_only_safe_metadata() {
+        let summary = compact_error(&serde_json::json!({
+            "Instrumentation": {"TraceId": "trace-123"},
+            "error": {
+                "code": "InvalidQuery",
+                "message": "secret@example.com searched for confidential subject"
+            }
+        }));
+        assert!(summary.contains("code=InvalidQuery"));
+        assert!(summary.contains("TraceId=trace-123"));
+        assert!(!summary.contains("secret@example.com"));
+        assert!(!summary.contains("confidential subject"));
+    }
+
+    #[test]
+    fn recognizes_only_transient_search_failures() {
+        assert!(transient_search_failure(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"code": "FanoutExternalBadRequest"})
+        ));
+        assert!(transient_search_failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::json!({})
+        ));
+        assert!(!transient_search_failure(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"code": "InvalidQuery"})
+        ));
+    }
 
     #[test]
     fn week_ranges_start_on_sunday() {
@@ -322,5 +788,70 @@ mod tests {
         let encoded = encode_owa_header(&request).unwrap();
         assert!(encoded.contains("Eastern%20Standard%20Time"));
         assert!(!encoded.contains("Eastern+Standard+Time"));
+    }
+
+    #[test]
+    fn mail_list_request_encodes_folder_filter_and_page() {
+        let request = find_mail_items_request(
+            MailFolder::Distinguished("inbox"),
+            "Unread",
+            25,
+            50,
+            "Eastern Standard Time",
+        );
+        assert_eq!(request["Body"]["ParentFolderIds"][0]["Id"], "inbox");
+        assert_eq!(
+            request["Body"]["ParentFolderIds"][0]["__type"],
+            "DistinguishedFolderId:#Exchange"
+        );
+        assert_eq!(request["Body"]["ViewFilter"], "Unread");
+        assert_eq!(request["Body"]["Paging"]["Offset"], 25);
+        assert_eq!(request["Body"]["Paging"]["MaxEntriesReturned"], 50);
+    }
+
+    #[test]
+    fn mail_get_request_uses_normalized_filtered_body() {
+        let request = get_mail_item_request("item-id", "Eastern Standard Time");
+        assert_eq!(request["Body"]["ItemIds"][0]["Id"], "item-id");
+        assert_eq!(request["Body"]["ShapeName"], "ItemNormalizedBody");
+        assert_eq!(request["Body"]["ItemShape"]["FilterHtmlContent"], true);
+        assert_eq!(
+            request["Body"]["ItemShape"]["BlockExternalImagesIfSenderUntrusted"],
+            true
+        );
+    }
+
+    #[test]
+    fn mail_search_request_encodes_subfolders_dates_and_attachment_refiner() {
+        let folders = vec!["folder-id".to_string(), "child-id".to_string()];
+        let query = MailSearchQuery {
+            query: "subject:(release) hasattachments:yes",
+            folder: MailSearchFolder::Subfolders(&folders),
+            offset: 25,
+            limit: 50,
+            start: Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
+            end: Some(NaiveDate::from_ymd_opt(2026, 7, 18).unwrap()),
+            has_attachments: true,
+        };
+        let request = mail_search_request(&query, "Eastern Standard Time");
+        let entity = &request["EntityRequests"][0];
+        assert_eq!(entity["From"], 25);
+        assert_eq!(entity["Size"], 75);
+        assert_eq!(
+            entity["Filter"]["And"][0]["Range"]["received"]["gte"],
+            "2026-07-01"
+        );
+        assert_eq!(
+            entity["Filter"]["And"][1]["Or"][0]["Term"]["FolderId"],
+            "folder-id"
+        );
+        assert_eq!(
+            entity["Filter"]["And"][1]["Or"][1]["Term"]["FolderId"],
+            "child-id"
+        );
+        assert_eq!(
+            entity["RefiningQueries"][0]["RefinerString"],
+            "ShallowRefiner::SearchScope:hasattachment:true"
+        );
     }
 }

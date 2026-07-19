@@ -1,10 +1,11 @@
-//! outlook — unofficial Outlook Web calendar CLI.
+//! outlook — unofficial Outlook Web calendar and mail CLI.
 
 use clap::{CommandFactory, Parser, Subcommand};
 
 mod auth;
 mod calendar;
 mod config;
+mod mail;
 mod oauth;
 mod output;
 mod owa;
@@ -16,7 +17,7 @@ mod unattended;
 #[command(
     name = "outlook",
     version,
-    about = "Query an Outlook Web calendar from the terminal"
+    about = "Query Outlook Web calendar and mail from the terminal"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -34,6 +35,9 @@ enum Command {
     /// Calendar queries
     #[command(subcommand)]
     Calendar(CalendarSubcommand),
+    /// Mailbox folders, messages, and search
+    #[command(subcommand)]
+    Mail(mail::MailSubcommand),
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -106,6 +110,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Calendar(command) => match command {
             CalendarSubcommand::List { week, raw } => calendar::list(&store, week, raw),
         },
+        Command::Mail(command) => mail::run(&store, command),
         Command::Completions { shell } => {
             let mut command = Cli::command();
             let binary = command.get_name().to_string();

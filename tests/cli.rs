@@ -46,7 +46,7 @@ fn help_exposes_requested_command_tree() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path();
     let help = success(home, &["--help"]);
-    for expected in ["auth", "config", "calendar"] {
+    for expected in ["auth", "config", "calendar", "mail"] {
         assert!(help.contains(expected));
     }
 
@@ -70,6 +70,53 @@ fn help_exposes_requested_command_tree() {
 
     let help = success(home, &["calendar", "list", "--help"]);
     for expected in ["--week", "last", "current", "next"] {
+        assert!(help.contains(expected));
+    }
+
+    let help = success(home, &["mail", "--help"]);
+    for expected in ["folders", "list", "get", "search"] {
+        assert!(help.contains(expected));
+    }
+
+    let help = success(home, &["mail", "list", "--help"]);
+    for expected in [
+        "--folder",
+        "--folder-id",
+        "--filter",
+        "to-me",
+        "has-files",
+        "mentions-me",
+        "has-calendar-invites",
+        "--offset",
+        "--limit",
+        "--raw",
+    ] {
+        assert!(help.contains(expected));
+    }
+
+    let help = success(home, &["mail", "search", "--help"]);
+    for expected in [
+        "--scope",
+        "all-folders",
+        "current-folder",
+        "subfolders",
+        "--from",
+        "--to",
+        "--cc",
+        "--bcc",
+        "--subject",
+        "--keywords",
+        "--body",
+        "--after",
+        "--before",
+        "--read-status",
+        "--has-attachments",
+        "--flagged",
+        "--importance",
+        "--category",
+        "--mentions-me",
+        "--to-me",
+    ] {
         assert!(help.contains(expected));
     }
 }
@@ -168,4 +215,76 @@ fn logout_preserves_configuration() {
 fn status_without_tokens_is_not_logged_in() {
     let temp = tempfile::tempdir().unwrap();
     assert!(success(temp.path(), &["auth", "status"]).contains("not logged in"));
+}
+
+#[test]
+fn mail_arguments_are_validated_before_authentication() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(
+        failure(temp.path(), &["mail", "list", "--limit", "0"])
+            .contains("limit must be between 1 and 50")
+    );
+    assert!(
+        failure(temp.path(), &["mail", "list", "--limit", "51"])
+            .contains("limit must be between 1 and 50")
+    );
+    assert!(
+        failure(temp.path(), &["mail", "list", "--folder", ""]).contains("folder cannot be empty")
+    );
+    assert!(failure(temp.path(), &["mail", "get", ""]).contains("message ID cannot be empty"));
+    assert!(
+        failure(
+            temp.path(),
+            &[
+                "mail",
+                "list",
+                "--folder",
+                "inbox",
+                "--folder-id",
+                "folder-id",
+            ]
+        )
+        .contains("--folder and --folder-id cannot be used together")
+    );
+    assert!(
+        failure(temp.path(), &["mail", "search"])
+            .contains("search requires QUERY or at least one search filter")
+    );
+    assert!(
+        failure(
+            temp.path(),
+            &["mail", "search", "probe", "--folder", "inbox"]
+        )
+        .contains("require --scope current-folder or subfolders")
+    );
+    assert!(
+        failure(
+            temp.path(),
+            &[
+                "mail",
+                "search",
+                "probe",
+                "--scope",
+                "current-folder",
+                "--folder",
+                "",
+            ]
+        )
+        .contains("folder cannot be empty")
+    );
+    assert!(
+        failure(
+            temp.path(),
+            &[
+                "mail",
+                "search",
+                "probe",
+                "--after",
+                "2026-07-18",
+                "--before",
+                "2026-07-01",
+            ]
+        )
+        .contains("--after cannot be later than --before")
+    );
 }
